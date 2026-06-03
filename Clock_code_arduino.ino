@@ -1,0 +1,770 @@
+/*Versión 12
+ Reloj con alarmas — ESP8266 + LCD + DS1307 + WiFi/NTP
+
+ Librerías: ESP8266WiFi, ESP8266WebServer, LiquidCrystal, Wire, RTClib, EEPROM
+
+ Wifis:
+
+ -Casa:
+  Name: DIGIFIBRA-B459
+  Pasw: CBQ4AAC7GE
+
+ -Inst:
+  Name: TelecosProves
+  Pasw: LabDoo5000
+
+*/ 
+ 
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <LiquidCrystal.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <time.h>
+
+// ---------- WiFi (edita aquí) ----------
+const char* ssid = "TelecosProves";
+const char* password = "LabDoo5000";
+
+// ---------- Hardware ----------
+// LCD: RS, E, D4, D5, D6, D7  →  D5, D4, D7, D8, D0, D3
+LiquidCrystal lcd(D5, D4, D7, D8, D0, D3);
+#define PIN_BUZZER D6
+// RTC I2C: SDA = D2, SCL = D1
+RTC_DS1307 rtc;
+
+ESP8266WebServer server(80);
+
+// ---------- Alarmas ----------
+struct Alarma {
+  byte hora;
+  byte minuto;
+  byte diasMask; // bits: Lun=0 … Dom=6
+};
+Alarma alarmas[50];
+int totalAlarmas = 0;
+
+const unsigned long duracionAlarma = 8000;
+bool alarmaActiva = false;
+unsigned long alarmaInicio;
+
+// ---------- Estado ----------
+String serialInput = "";
+bool wifi_ok = false;
+bool rtc_actualizado = false;
+
+bool blinkOn = true;
+unsigned long lastBlink = 0;
+const unsigned long blinkInterval = 500;
+
+unsigned long ultimaSincronizacion = 0;
+const unsigned long intervaloSync = 6UL * 60UL * 60UL * 1000UL;
+
+// Zona horaria POSIX: España peninsular (CET / CEST automático).
+// El ESP8266 aplica esto con localtime_r() tras sincronizar NTP.
+static const char kZonaEspana[] = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+
+static char paginaWeb[4096];
+
+// ---------- RTC: lectura fiable y comprobar fecha ----------
+static bool rtcEsBisiesto(int y) {
+  return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
+
+static int rtcDiasEnMes(int y, int m) {
+  static const uint8_t mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  if (m < 1 || m > 12) return 0;
+  int d = mdays[m - 1];
+  if (m == 2 && rtcEsBisiesto(y)) d = 29;
+  return d;
+}
+
+static bool mismoInstanteRtc(const DateTime& a, const DateTime& b) {
+  return a.year() == b.year() && a.month() == b.month() && a.day() == b.day() &&
+         a.hour() == b.hour() && a.minute() == b.minute() && a.second() == b.second();
+}
+
+static bool fechaRtcCoherente(const DateTime& t) {
+  const int y = t.year();
+  if (y < 2024 || y > 2099) return false;
+  const int m = t.month();
+  if (m < 1 || m > 12) return false;
+  const int d = t.day();
+  const int dim = rtcDiasEnMes(y, m);
+  if (d < 1 || d > dim) return false;
+  if (t.hour() > 23 || t.minute() > 59 || t.second() > 59) return false;
+  return true;
+}
+
+static DateTime leerRtcEstable() {
+  DateTime t = rtc.now();
+  for (int i = 0; i < 12; i++) {
+    delay(25);
+    const DateTime u = rtc.now();
+    if (mismoInstanteRtc(t, u)) return t;
+    t = u;
+  }
+  return t;
+}
+
+// ---------- Declaraciones ----------
+void guardarAlarmasEEPROM();
+void cargarAlarmasEEPROM();
+void ordenarAlarmas();
+int obtenerProximaAlarma(DateTime ahora);
+uint8_t parseDaysSpec(String s);
+String daysMaskToString(byte mask);
+static void diasMaskACadena(byte mask, char* out, size_t outN);
+void verificarAlarma(DateTime ahora);
+void sincronizarConNTP();
+void printHoraEnLCD(DateTime dt);
+void handleRoot();
+void handleAddAlarma();
+void handleDeleteAlarma();
+void handleDeleteAll();
+void handleSetHora();
+void handleNotFound();
+void procesarComando(String cmd);
+
+// ---------- Sonido ----------
+void beep(int duracion = 150) {
+  tone(PIN_BUZZER, 1000);
+  delay(duracion);
+  noTone(PIN_BUZZER);
+}
+
+void beepAlarma() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(3000);
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(200);
+  }
+}
+
+void beepError() {
+  for (int i = 0; i < 2; i++) {
+    beep(120);
+    delay(120);
+  }
+}
+
+// Muestra en LCD si el RTC trae una fecha usable; si el reloj está parado (bit CH)
+// pero la fecha es buena, reescribe el mismo instante para arrancar el oscilador.
+static void pantallaEstadoRtcAlArranque() {
+  delay(50);
+  DateTime now = leerRtcEstable();
+  bool ok = fechaRtcCoherente(now);
+
+  if (ok && !rtc.isrunning()) {
+    rtc.adjust(now);
+    delay(30);
+    now = leerRtcEstable();
+    ok = fechaRtcCoherente(now);
+  }
+
+  if (!ok) {
+    lcd.clear();
+    lcd.print("RTC sin hora valida");
+    lcd.setCursor(0, 1);
+    lcd.print("Sincronizando...");
+    delay(1200);
+  } else {
+    lcd.clear();
+    lcd.print("Usando hora RTC");
+    lcd.setCursor(0, 1);
+    lcd.print(now.timestamp(DateTime::TIMESTAMP_DATE));
+    delay(1500);
+  }
+}
+
+// ---------- setup / loop ----------
+void setup() {
+  EEPROM.begin(512);
+  cargarAlarmasEEPROM();
+
+  lcd.begin(16, 2);
+  lcd.print("Iniciando...");
+  delay(1500);
+  lcd.clear();
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  Wire.begin(D2, D1);
+  Wire.setClockStretchLimit(500);
+
+  if (!rtc.begin()) {
+    lcd.clear();
+    lcd.print("RTC no detectado");
+    while (1) delay(500);
+  }
+
+  lcd.clear();
+  lcd.print("RTC OK");
+  delay(800);
+
+  pantallaEstadoRtcAlArranque();
+  sincronizarConNTP();
+
+  lcd.clear();
+  if (WiFi.status() == WL_CONNECTED) {
+    wifi_ok = true;
+    beep();
+    lcd.print("IP (web):");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+    delay(5000);
+  } else {
+    wifi_ok = false;
+    beepError();
+    lcd.print("Sin WiFi");
+    delay(1500);
+  }
+  lcd.clear();
+
+  server.on("/", handleRoot);
+  server.on("/add", handleAddAlarma);
+  server.on("/delete", handleDeleteAlarma);
+  server.on("/deleteAll", handleDeleteAll);
+  server.on("/sethora", handleSetHora);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.begin(115200);
+}
+
+void loop() {
+  yield();
+  server.handleClient();
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') {
+      serialInput.trim();
+      if (serialInput.length() > 0) procesarComando(serialInput);
+      serialInput = "";
+    } else {
+      serialInput += c;
+    }
+  }
+
+  if (millis() - lastBlink > blinkInterval) {
+    lastBlink = millis();
+    blinkOn = !blinkOn;
+  }
+
+  if (millis() - ultimaSincronizacion > intervaloSync) sincronizarConNTP();
+
+  DateTime ahora = rtc.now();
+  verificarAlarma(ahora);
+  if (!alarmaActiva) printHoraEnLCD(ahora);
+
+  delay(100);
+}
+
+// RTClib dayOfTheWeek: 0 = domingo … 6 = sábado
+static char letraDiaSemana(int dow) {
+  static const char letras[] = {'D', 'L', 'M', 'X', 'J', 'V', 'S'};
+  return letras[dow % 7];
+}
+
+void printHoraEnLCD(DateTime ahora) {
+  lcd.setCursor(0, 0);
+  lcd.print("                ");
+  lcd.setCursor(0, 0);
+
+  char buf[17];
+  sprintf(buf, "%c %02d:%02d", letraDiaSemana(ahora.dayOfTheWeek()), ahora.hour(), ahora.minute());
+  if (!blinkOn) buf[4] = ' ';
+  lcd.print(buf);
+
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  lcd.setCursor(0, 1);
+
+  int idx = obtenerProximaAlarma(ahora);
+  if (idx == -1) {
+    lcd.print("Sin alarmas");
+  } else {
+    char dbuf[12];
+    diasMaskACadena(alarmas[idx].diasMask, dbuf, sizeof dbuf);
+    sprintf(buf, "%-7s %02d:%02d", dbuf, alarmas[idx].hora, alarmas[idx].minuto);
+    lcd.print(buf);
+  }
+}
+
+// Conecta WiFi, pide hora por NTP y escribe en el RTC la hora local (España).
+void sincronizarConNTP() {
+  lcd.clear();
+  lcd.print("WiFi...");
+
+  WiFi.begin(ssid, password);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(500);
+    lcd.print(".");
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    lcd.clear();
+    lcd.print("Sin WiFi");
+    delay(2000);
+    lcd.clear();
+    return;
+  }
+
+  lcd.clear();
+  lcd.print("NTP...");
+  configTime(kZonaEspana, "pool.ntp.org", "time.nist.gov");
+
+  time_t epoch = 0;
+  int intentos = 0;
+  do {
+    time(&epoch);
+    delay(500);
+    intentos++;
+  } while (epoch < 100000 && intentos < 40);
+
+  if (epoch < 100000) {
+    lcd.clear();
+    lcd.print("Fallo NTP");
+    delay(2000);
+    lcd.clear();
+    return;
+  }
+
+  struct tm local;
+  localtime_r(&epoch, &local);
+  rtc.adjust(DateTime(
+      local.tm_year + 1900,
+      local.tm_mon + 1,
+      local.tm_mday,
+      local.tm_hour,
+      local.tm_min,
+      local.tm_sec));
+
+  ultimaSincronizacion = millis();
+  rtc_actualizado = true;
+
+  lcd.clear();
+  lcd.print("RTC actualizado");
+  delay(2000);
+  lcd.clear();
+}
+
+// ---------- EEPROM ----------
+void guardarAlarmasEEPROM() {
+  EEPROM.write(0, totalAlarmas);
+  int addr = 1;
+  for (int i = 0; i < totalAlarmas; i++) {
+    EEPROM.write(addr++, alarmas[i].hora);
+    EEPROM.write(addr++, alarmas[i].minuto);
+    EEPROM.write(addr++, alarmas[i].diasMask);
+  }
+  EEPROM.commit();
+}
+
+void cargarAlarmasEEPROM() {
+  totalAlarmas = EEPROM.read(0);
+  if (totalAlarmas > 50) totalAlarmas = 0;
+  int addr = 1;
+  for (int i = 0; i < totalAlarmas; i++) {
+    alarmas[i].hora = EEPROM.read(addr++);
+    alarmas[i].minuto = EEPROM.read(addr++);
+    alarmas[i].diasMask = EEPROM.read(addr++);
+  }
+}
+
+void ordenarAlarmas() {
+  for (int i = 0; i < totalAlarmas - 1; i++) {
+    for (int j = i + 1; j < totalAlarmas; j++) {
+      if (alarmas[j].hora < alarmas[i].hora ||
+          (alarmas[j].hora == alarmas[i].hora && alarmas[j].minuto < alarmas[i].minuto)) {
+        Alarma tmp = alarmas[i];
+        alarmas[i] = alarmas[j];
+        alarmas[j] = tmp;
+      }
+    }
+  }
+}
+
+// ---------- Alarmas ----------
+void verificarAlarma(DateTime ahora) {
+  if (alarmaActiva) {
+    if (millis() - alarmaInicio > duracionAlarma) {
+      alarmaActiva = false;
+      digitalWrite(PIN_BUZZER, LOW);
+      lcd.clear();
+    }
+    return;
+  }
+
+  int dow = ahora.dayOfTheWeek();
+  int bit = (dow + 6) % 7;
+  int ahoraMin = ahora.hour() * 60 + ahora.minute();
+
+  for (int i = 0; i < totalAlarmas; i++) {
+    if (!(alarmas[i].diasMask & (1 << bit))) continue;
+    int aMin = alarmas[i].hora * 60 + alarmas[i].minuto;
+    if (aMin == ahoraMin && ahora.second() == 0) {
+      alarmaActiva = true;
+      alarmaInicio = millis();
+      lcd.clear();
+      beepAlarma();
+      lcd.print("Alarma ");
+      lcd.print(char('A' + i));
+      lcd.setCursor(0, 1);
+      lcd.print("SONANDO!!!");
+      break;
+    }
+  }
+}
+
+// Próxima alarma hoy (misma lógica que antes: solo compara el día actual).
+int obtenerProximaAlarma(DateTime ahora) {
+  if (totalAlarmas == 0) return -1;
+
+  long best = 99999999;
+  int bestIndex = -1;
+  int dow = ahora.dayOfTheWeek();
+  int bit = (dow + 6) % 7;
+  int nowMin = ahora.hour() * 60 + ahora.minute();
+
+  for (int i = 0; i < totalAlarmas; i++) {
+    if (!(alarmas[i].diasMask & (1 << bit))) continue;
+    long diff = (long)alarmas[i].hora * 60 + alarmas[i].minuto - nowMin;
+    if (diff >= 0 && diff < best) {
+      best = diff;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
+uint8_t parseDaysSpec(String s) {
+  s.toUpperCase();
+  s.replace(" ", "");
+  uint8_t mask = 0;
+  for (int i = 0; i < s.length(); i++) {
+    switch (s.charAt(i)) {
+      case 'L': mask |= 1 << 0; break;
+      case 'M': mask |= 1 << 1; break;
+      case 'X': mask |= 1 << 2; break;
+      case 'J': mask |= 1 << 3; break;
+      case 'V': mask |= 1 << 4; break;
+      case 'S': mask |= 1 << 5; break;
+      case 'D': mask |= 1 << 6; break;
+    }
+  }
+  if (mask == 0) mask = 0x7F;
+  return mask;
+}
+
+String daysMaskToString(byte m) {
+  char buf[12];
+  diasMaskACadena(m, buf, sizeof buf);
+  if (buf[0] == '-' && buf[1] == '\0') return "";
+  return String(buf);
+}
+
+static void diasMaskACadena(byte mask, char* out, size_t outN) {
+  size_t k = 0;
+  if (mask & 1 << 0) { if (k + 1 < outN) out[k++] = 'L'; }
+  if (mask & 1 << 1) { if (k + 1 < outN) out[k++] = 'M'; }
+  if (mask & 1 << 2) { if (k + 1 < outN) out[k++] = 'X'; }
+  if (mask & 1 << 3) { if (k + 1 < outN) out[k++] = 'J'; }
+  if (mask & 1 << 4) { if (k + 1 < outN) out[k++] = 'V'; }
+  if (mask & 1 << 5) { if (k + 1 < outN) out[k++] = 'S'; }
+  if (mask & 1 << 6) { if (k + 1 < outN) out[k++] = 'D'; }
+  if (k == 0) {
+    if (outN >= 2) {
+      out[0] = '-';
+      out[1] = '\0';
+    } else if (outN >= 1) out[0] = '\0';
+    return;
+  }
+  out[k] = '\0';
+}
+
+// ---------- Web ----------
+void handleRoot() {
+  yield();
+  DateTime a = rtc.now();
+  size_t w = 0;
+  int n;
+
+  n = snprintf(paginaWeb + w, sizeof(paginaWeb) - w,
+               "<!DOCTYPE html><html><head>"
+               "<meta charset=utf-8>"
+               "<meta name=viewport content=\"width=device-width, initial-scale=1\">"
+               "<title>Reloj</title>"
+               "<style>"
+               ":root{font-size:clamp(17px,4.2vw,22px)}"
+               "body{font-family:system-ui,Segoe UI,sans-serif;margin:0;padding:1rem;"
+               "max-width:28rem;margin-inline:auto;line-height:1.55;color:#111;background:#f0f2f5}"
+               "h2{font-size:1.35em;margin:0 0 .75em}"
+               "h3{font-size:1.12em;margin:1.2em 0 .45em}"
+               "input{font-size:1em;padding:.5em .6em;border:1px solid #bbb;border-radius:8px;box-sizing:border-box}"
+               "input[type=number]{width:5.2rem;text-align:center}"
+               "input[name=spec]{width:100%;max-width:22rem;display:block;margin:.4em 0}"
+               "input[type=submit]{padding:.6em 1.15em;margin:.45em .25em 0 0;border-radius:10px;border:0;"
+               "background:#2563eb;color:#fff;font-weight:600;cursor:pointer}"
+               "label{display:inline-block;margin:.3em .5em .3em 0;vertical-align:middle}"
+               "form.seccion{background:#fff;padding:1rem 1.1rem;border-radius:12px;"
+               "box-shadow:0 1px 5px rgba(0,0,0,.07);margin:.85rem 0}"
+               "p{margin:.55em 0}"
+               "a{color:#1d4ed8;font-size:1em}"
+               "hr{border:0;border-top:1px solid #ccc;margin:1.5rem 0}"
+               ".fila{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.4em 0}"
+               "</style></head><body>"
+               "<h2>Reloj con Alarmas</h2>"
+               "<p>Hora actual: <strong>%02d:%02d:%02d</strong></p>",
+               a.hour(), a.minute(), a.second());
+  if (n > 0) w += (size_t)n;
+
+  n = snprintf(paginaWeb + w, sizeof(paginaWeb) - w,
+               "<h3>Ajuste manual de la hora</h3>"
+               "<form class=seccion action='/sethora' method=get>"
+               "<div class=fila>"
+               "<label>Hora<input type=number name=h value=%d min=0 max=23></label>"
+               "<label>Min<input type=number name=mi value=%d min=0 max=59></label>"
+               "<label>Seg<input type=number name=s value=%d min=0 max=59></label>"
+               "</div>"
+               "<input type=submit value='Aplicar al RTC'></form>",
+               a.hour(), a.minute(), a.second());
+  if (n > 0) w += (size_t)n;
+
+  n = snprintf(paginaWeb + w, sizeof(paginaWeb) - w, "<h3>Alarmas</h3><div class=seccion>");
+  if (n > 0) w += (size_t)n;
+
+  if (totalAlarmas == 0) {
+    n = snprintf(paginaWeb + w, sizeof(paginaWeb) - w, "<p>(sin alarmas)</p>");
+    if (n > 0) w += (size_t)n;
+  } else {
+    for (int i = 0; i < totalAlarmas; i++) {
+      if (w > sizeof(paginaWeb) - 200) break;
+      char ds[12];
+      diasMaskACadena(alarmas[i].diasMask, ds, sizeof ds);
+      n = snprintf(paginaWeb + w, sizeof(paginaWeb) - w,
+                   "<p class=fila><span>%d: %s %02d:%02d</span>"
+                   "<a href='/delete?id=%d'>Eliminar</a></p>",
+                   i, ds, alarmas[i].hora, alarmas[i].minuto, i);
+      if (n > 0) w += (size_t)n;
+    }
+  }
+
+  n = snprintf(paginaWeb + w, sizeof(paginaWeb) - w,
+               "</div><hr>"
+               "<form class=seccion action='/add'>"
+               "<label>Nueva alarma (ej: LMXJV 13:50)</label>"
+               "<input name=spec placeholder='LMXJV 08:30'>"
+               "<input type=submit value='Agregar'></form>"
+               "<p><a href='/deleteAll'>Eliminar todas las alarmas</a></p>"
+               "</body></html>");
+  if (n > 0) w += (size_t)n;
+
+  paginaWeb[sizeof(paginaWeb) - 1] = '\0';
+  server.send(200, "text/html", paginaWeb);
+}
+
+void handleNotFound() {
+  yield();
+  server.send(404, "text/plain", "404");
+}
+
+void handleAddAlarma() {
+  if (server.hasArg("spec")) {
+    String spec = server.arg("spec");
+    spec.trim();
+    int sp = spec.lastIndexOf(' ');
+    if (sp > 0) {
+      String days = spec.substring(0, sp);
+      String tim = spec.substring(sp + 1);
+      int p = tim.indexOf(':');
+      if (p > 0) {
+        byte h = tim.substring(0, p).toInt();
+        byte m = tim.substring(p + 1).toInt();
+        byte mask = parseDaysSpec(days);
+        if (totalAlarmas < 50) {
+          alarmas[totalAlarmas].hora = h;
+          alarmas[totalAlarmas].minuto = m;
+          alarmas[totalAlarmas].diasMask = mask;
+          totalAlarmas++;
+          ordenarAlarmas();
+          guardarAlarmasEEPROM();
+        }
+      }
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDeleteAlarma() {
+  if (server.hasArg("id")) {
+    int id = server.arg("id").toInt();
+    if (id >= 0 && id < totalAlarmas) {
+      for (int i = id; i < totalAlarmas - 1; i++) alarmas[i] = alarmas[i + 1];
+      totalAlarmas--;
+      ordenarAlarmas();
+      guardarAlarmasEEPROM();
+    }
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDeleteAll() {
+  totalAlarmas = 0;
+  guardarAlarmasEEPROM();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleSetHora() {
+  yield();
+  if (!server.hasArg("h") || !server.hasArg("mi") || !server.hasArg("s")) {
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+  const int h = server.arg("h").toInt();
+  const int mi = server.arg("mi").toInt();
+  const int s = server.arg("s").toInt();
+  if (h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) {
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+  DateTime hoy = rtc.now();
+  rtc.adjust(DateTime(hoy.year(), hoy.month(), hoy.day(), (uint8_t)h, (uint8_t)mi, (uint8_t)s));
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ---------- SERIAL ----------
+void procesarComando(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+  Serial.println("> " + cmd);
+
+
+// ---------- ALARMAS ----------
+  if (cmd.startsWith("A")) {
+    int i = 1;
+    while (i < cmd.length() && isDigit(cmd[i])) i++;
+    int idx = cmd.substring(1, i).toInt();
+
+    if (idx < 0 || idx >= 50) {
+      Serial.println("Indice fuera de rango (0-49)");
+      return;
+    }
+
+    if (i == cmd.length()) {
+      if (idx < totalAlarmas) {
+        for (int j = idx; j < totalAlarmas - 1; j++) alarmas[j] = alarmas[j + 1];
+        totalAlarmas--;
+        guardarAlarmasEEPROM();
+        Serial.println("Alarma borrada.");
+      } else {
+        Serial.println("No existe esa alarma.");
+      }
+      return;
+    }
+
+    String rest = cmd.substring(i);
+    rest.trim();
+    int esp = rest.indexOf(' ');
+    if (esp < 0) {
+      Serial.println("Formato incorrecto.");
+      return;
+    }
+
+    String horaStr = rest.substring(0, esp);
+    String dias = rest.substring(esp + 1);
+    dias.replace("-", "");
+
+    int p = horaStr.indexOf(':');
+    if (p < 0) {
+      Serial.println("Formato hora incorrecto.");
+      return;
+    }
+
+    int H = horaStr.substring(0, p).toInt();
+    int M = horaStr.substring(p + 1).toInt();
+    if (H > 23 || M > 59) {
+      Serial.println("Hora invalida.");
+      return;
+    }
+
+    alarmas[idx].hora = H;
+    alarmas[idx].minuto = M;
+    alarmas[idx].diasMask = parseDaysSpec(dias);
+    if (idx == totalAlarmas) totalAlarmas++;
+    ordenarAlarmas();
+    guardarAlarmasEEPROM();
+    Serial.println("Alarma configurada.");
+    return;
+  }
+
+
+// ---------- LISTAR L ----------
+  if (cmd == "L") {
+    Serial.println("=== LISTA DE ALARMAS ===");
+    for (int i = 0; i < totalAlarmas; i++) {
+      Serial.print("A");
+      Serial.print(i);
+      Serial.print(": ");
+      Serial.print(daysMaskToString(alarmas[i].diasMask));
+      Serial.print(" ");
+      Serial.print(alarmas[i].hora);
+      Serial.print(":");
+      Serial.println(alarmas[i].minuto);
+    }
+    if (totalAlarmas == 0) Serial.println("(Sin alarmas)");
+    return;
+  }
+
+
+// ---------- ? ----------
+  if (cmd == "?") {
+    Serial.println("=== ESTADO ===");
+    Serial.println(wifi_ok ? "WiFi: OK" : "WiFi: no conectado");
+    Serial.println(rtc_actualizado ? "RTC: actualizado por NTP al arranque" : "RTC: sin NTP en ultimo intento");
+
+    bool hayError = false;
+    for (int i = 0; i < totalAlarmas; i++) {
+      if (alarmas[i].hora > 23 || alarmas[i].minuto > 59 || alarmas[i].diasMask == 0) {
+        Serial.print("Alarma ");
+        Serial.print(i);
+        Serial.println(" erronea.");
+        hayError = true;
+      }
+    }
+    if (!hayError) Serial.println("Alarmas: OK");
+    return;
+  }
+
+
+// ---------- BEEP ----------
+  if (cmd == "BEEP") {
+    Serial.println("Sonando en 3 segundos");
+    delay(3000);
+    beepAlarma();
+    return;
+  }
+
+  if (cmd == "HELP") {
+    Serial.println("L        lista alarmas");
+    Serial.println("A5       borra alarma 5");
+    Serial.println("A0 08:30 LMXJV  crea/edita alarma 0");
+    Serial.println("?        estado WiFi / RTC / alarmas");
+    Serial.println("BEEP     prueba sonido");
+    return;
+  }
+
+  Serial.println("Comando no reconocido. Escribe HELP");
+}
