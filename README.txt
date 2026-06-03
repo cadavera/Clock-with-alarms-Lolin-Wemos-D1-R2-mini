@@ -1,6 +1,6 @@
 Hi there lol
 
-If you are reading this, it means you downloaded my work (and I'm really happy about it).
+If you are reading this, it means you're interested in my work (and I'm really happy about it).
 
 
 IMPORTANT:
